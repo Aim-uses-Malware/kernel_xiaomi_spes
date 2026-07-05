@@ -1,0 +1,187 @@
+name: Build SPES Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: 'Defconfig to build (relative to arch/arm64/configs)'
+        required: true
+        default: 'vendor/spes-perf_defconfig'
+      aosp_clang_branch:
+        description: 'AOSP clang prebuilts branch to pull the toolchain from (android.googlesource.com/platform/prebuilts/clang/host/linux-x86)'
+        required: true
+        default: 'android12-release'
+      aosp_clang_version:
+        description: 'AOSP clang release folder name inside that branch (e.g. clang-r383902). r383902 is the Android 11/12-era clang commonly used for msm-4.19 Xiaomi trees like spes.'
+        required: true
+        default: 'clang-r383902'
+      build_user:
+        description: 'Build author shown in "uname -a" / kernel version string'
+        required: true
+        default: 'AimRite2'
+      build_host:
+        description: 'Build host shown in "uname -a"'
+        required: true
+        default: 'GitHubCI'
+      localversion:
+        description: 'Suffix appended to the kernel version (authorship tag)'
+        required: true
+        default: '-AimRite2'
+      enable_kernelsu:
+        description: 'Hook KernelSU into the kernel (adds root support). Leave OFF for forks that already ship KernelSU-Next as a submodule (e.g. *-ksun-susfs branches) — enabling this on top of one of those will double-integrate and break the build.'
+        required: false
+        type: boolean
+        default: false
+      kernelsu_variant:
+        description: 'Which fork to integrate — only used if enable_kernelsu is checked'
+        required: false
+        type: choice
+        options:
+          - kernelsu
+          - kernelsu-next
+        default: 'kernelsu'
+      kernelsu_ref:
+        description: 'Branch/tag passed to the setup script. Leave empty for latest tagged release. KernelSU Next also accepts dev / stable / legacy.'
+        required: false
+        default: ''
+      anykernel_repo:
+        description: 'AnyKernel3 repo to package the zip with (owner/repo). Leave empty to skip packaging.'
+        required: false
+        default: ''
+      anykernel_branch:
+        description: 'AnyKernel3 branch'
+        required: false
+        default: 'main'
+
+env:
+  KERNEL_DIR: kernel
+  OUT_DIR: out
+  ARCH: arm64
+  CLANG_DIR: clang
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          path: ${{ env.KERNEL_DIR }}
+          fetch-depth: 1
+          # Required: this fork ships KernelSU-Next (legacy_susfs) as a git
+          # submodule at the repo root. actions/checkout does NOT fetch
+          # submodules by default, which leaves that directory empty and
+          # breaks the existing drivers/Kconfig + drivers/Makefile hooks.
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev dwarves \
+            build-essential python3 zip curl git ca-certificates \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+
+      # AOSP clang, fetched directly from Google's Gitiles "+archive"
+      # endpoint. This grabs just the requested clang-rXXXXXX folder as a
+      # tarball instead of cloning the entire (multi-GB) prebuilts history.
+      # r383902 (android12-release) is the version commonly paired with
+      # msm-4.19 Xiaomi trees such as spes; override via the workflow inputs
+      # if a different device/tree expects another release.
+      - name: Fetch Clang toolchain (AOSP Clang)
+        run: |
+          mkdir -p "${{ env.CLANG_DIR }}"
+          cd "${{ env.CLANG_DIR }}"
+          BRANCH="${{ github.event.inputs.aosp_clang_branch || 'android12-release' }}"
+          VERSION="${{ github.event.inputs.aosp_clang_version || 'clang-r383902' }}"
+          curl -L "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${BRANCH}/${VERSION}.tar.gz" -o clang.tar.gz
+          tar -xzf clang.tar.gz
+          rm clang.tar.gz
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+
+      - name: Export build identity
+        run: |
+          echo "KBUILD_BUILD_USER=${{ github.event.inputs.build_user || 'AimRite2' }}" >> "$GITHUB_ENV"
+          echo "KBUILD_BUILD_HOST=${{ github.event.inputs.build_host || 'GitHubCI' }}" >> "$GITHUB_ENV"
+
+      - name: Set LOCALVERSION (authorship tag)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          LOCALVERSION="${{ github.event.inputs.localversion || '-AimRite2' }}"
+          echo "$LOCALVERSION" > localversion
+          echo "CONFIG_LOCALVERSION_AUTO=n" >> arch/arm64/configs/${{ github.event.inputs.defconfig || 'vendor/spes-perf_defconfig' }}
+
+      # Runs the upstream setup script for the chosen fork, which drops the
+      # KernelSU driver into drivers/kernelsu and wires it into
+      # drivers/Kconfig + drivers/Makefile. Skipped automatically if a
+      # KernelSU tree is already present (e.g. this fork's pre-integrated
+      # KernelSU-Next submodule) to avoid double-integrating and corrupting
+      # those hooks.
+      - name: Integrate KernelSU (optional)
+        if: ${{ github.event.inputs.enable_kernelsu == 'true' }}
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          if [ -f "KernelSU-Next/kernel/Kconfig" ] || [ -f "drivers/kernelsu/Kconfig" ]; then
+            echo "A KernelSU tree already exists in this source (likely a pre-integrated submodule)."
+            echo "Skipping setup.sh to avoid double-integration. Disable 'enable_kernelsu' for this fork instead."
+            exit 0
+          fi
+          REF="${{ github.event.inputs.kernelsu_ref }}"
+          if [ "${{ github.event.inputs.kernelsu_variant || 'kernelsu' }}" = "kernelsu-next" ]; then
+            SCRIPT_URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
+          else
+            SCRIPT_URL="https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh"
+          fi
+          if [ -n "$REF" ]; then
+            curl -LSs "$SCRIPT_URL" | bash -s "$REF"
+          else
+            curl -LSs "$SCRIPT_URL" | bash -
+          fi
+          echo "CONFIG_KSU=y" >> arch/arm64/configs/${{ github.event.inputs.defconfig || 'vendor/spes-perf_defconfig' }}
+
+      - name: Generate defconfig
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          make -j$(nproc) O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} \
+            CC=clang LLVM=1 LLVM_IAS=1 LD=ld.lld \
+            ${{ github.event.inputs.defconfig || 'vendor/spes-perf_defconfig' }}
+
+      - name: Build kernel
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          make -j$(nproc) O=${{ env.OUT_DIR }} ARCH=${{ env.ARCH }} \
+            CC=clang LLVM=1 LLVM_IAS=1 LD=ld.lld \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            Image.gz-dtb dtbo.img 2>&1 | tee build.log
+
+      - name: Collect build artifacts
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          mkdir -p artifacts
+          find ${{ env.OUT_DIR }}/arch/arm64/boot -maxdepth 1 \
+            \( -name 'Image*' -o -name 'dtbo.img' \) -exec cp {} artifacts/ \;
+          cp build.log artifacts/ || true
+
+      - name: Package with AnyKernel3
+        if: ${{ github.event.inputs.anykernel_repo != '' }}
+        run: |
+          git clone --depth=1 -b "${{ github.event.inputs.anykernel_branch || 'main' }}" \
+            https://github.com/${{ github.event.inputs.anykernel_repo }} AnyKernel3
+          cp ${{ env.KERNEL_DIR }}/artifacts/Image.gz-dtb AnyKernel3/ 2>/dev/null || true
+          cp ${{ env.KERNEL_DIR }}/artifacts/dtbo.img AnyKernel3/ 2>/dev/null || true
+          cd AnyKernel3
+          zip -r9 ../spes-kernel-${{ github.run_number }}.zip . -x '.git*'
+
+      - name: Upload raw build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spes-kernel-raw-${{ github.run_number }}
+          path: ${{ env.KERNEL_DIR }}/artifacts/*
+
+      - name: Upload flashable zip
+        if: ${{ github.event.inputs.anykernel_repo != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: spes-kernel-flashable-${{ github.run_number }}
+          path: spes-kernel-${{ github.run_number }}.zip
